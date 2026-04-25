@@ -45,19 +45,19 @@ class MediaItem:
     micro_video_height: int | None = None
 
 
-# @dataclass(slots=True)
-# class CollectionItem:
-#     collection_media_key: str
-#     collection_album_id: str
-#     title: str
-#     total_items: int
-#     type: int
-#     sort_order: int
-#     is_custom_ordered: bool
-#     cover_item_media_key: str | None = None
-#     start: int | None = None
-#     end: int | None = None
-#     last_activity_time_ms: int | None = None
+@dataclass(slots=True)
+class CollectionItem:
+    collection_media_key: str
+    collection_album_id: str
+    title: str
+    total_items: int
+    type: int
+    sort_order: int
+    is_custom_ordered: bool
+    cover_item_media_key: str | None = None
+    start: int | None = None
+    end: int | None = None
+    last_activity_time_ms: int | None = None
 
 
 # @dataclass(slots=True)

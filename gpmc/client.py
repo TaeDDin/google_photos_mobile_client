@@ -598,8 +598,12 @@ class Client:
 
     def add_to_album(self, media_keys: Sequence[str], album_name: str, show_progress: bool) -> list[str]:
         """
-        Add media items to one or more albums with the given name. If the total number of items exceeds the album limit,
-        additional albums with numbered suffixes are created. The first album will also have a suffix if there are multiple albums.
+        Add media items to one or more albums with the given name.
+
+        If an album with the same name exists in the local cache, items are added to
+        that existing album instead of always creating a new one. If the total number
+        of items exceeds the album limit, additional albums with numbered suffixes are
+        created. The first album also gets a suffix when multiple albums are needed.
 
         Args:
             media_keys: Media keys of the media items to be added to album.
@@ -632,12 +636,26 @@ class Client:
 
         context = (show_progress and Live(progress)) or nullcontext()
 
+        # Refresh cache before album lookup so existing albums can be reused.
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.debug("Updating cache before album operation...")
+        self.update_cache(show_progress=False)
+
         with context:
             for i in range(0, len(media_keys), album_limit):
                 album_batch = media_keys[i : i + album_limit]
                 # Add a suffix if media_keys will not fit into a single album
                 current_album_name = f"{album_name} {album_counter}" if len(media_keys) > album_limit else album_name
                 current_album_key = None
+
+                with Storage(self.db_path) as storage:
+                    existing_collection = storage.get_collection_by_title(current_album_name)
+                    if existing_collection:
+                        current_album_key = existing_collection.collection_media_key
+                        self.logger.info(f"Found existing album '{current_album_name}' in cache. Reusing album.")
+                    else:
+                        self.logger.info(f"Album '{current_album_name}' not found in cache. Creating new album.")
+
                 for j in range(0, len(album_batch), batch_size):
                     batch = album_batch[j : j + batch_size]
                     if current_album_key is None:
@@ -647,6 +665,8 @@ class Client:
                     else:
                         # Add to the existing album
                         self.api.add_media_to_album(album_media_key=current_album_key, media_keys=batch)
+                        if current_album_key not in album_keys:
+                            album_keys.append(current_album_key)
                     progress.update(task, advance=len(batch))
                 album_counter += 1
         return album_keys
@@ -669,13 +689,15 @@ class Client:
             TextColumn("{task.description}"),
             SpinnerColumn(),
             "Updates: [green]{task.fields[updated]:>8}[/green]",
-            "Deletions: [red]{task.fields[deleted]:>8}[/red]",
+            "Media Deletions: [red]{task.fields[media_deleted]:>8}[/red]",
+            "Album Deletions: [yellow]{task.fields[collection_deleted]:>8}[/yellow]",
             "Pages: [cyan]{task.fields[pages]:>6}[/cyan]",
         )
         task_id = progress.add_task(
             "[bold magenta]Updating local cache[/bold magenta]:",
             updated=0,
-            deleted=0,
+            media_deleted=0,
+            collection_deleted=0,
             pages=0,
         )
         context = (show_progress and Live(progress)) or nullcontext()
@@ -719,18 +741,21 @@ class Client:
                 raise SyncCycleError(f"Sync token unchanged after {sync_cycle_count} cycles. sync_token={sync_token[:50]}...")
 
             response = self.api.get_library_state(sync_token)
-            next_sync_token, next_resume_token, remote_media, media_keys_to_delete = parse_db_update(response)
+            next_sync_token, next_resume_token, remote_media, collections, media_keys_to_delete, collection_keys_to_delete = parse_db_update(response)
 
             with Storage(self.db_path) as storage:
                 storage.update_sync_tokens(next_sync_token, next_resume_token)
                 storage.update(remote_media)
+                storage.update_collections(collections)
                 storage.delete(media_keys_to_delete)
+                storage.delete_collections(collection_keys_to_delete)
 
             task = progress.tasks[int(task_id)]
             progress.update(
                 task_id,
                 updated=task.fields["updated"] + len(remote_media),
-                deleted=task.fields["deleted"] + len(media_keys_to_delete),
+                media_deleted=task.fields["media_deleted"] + len(media_keys_to_delete),
+                collection_deleted=task.fields["collection_deleted"] + len(collection_keys_to_delete),
             )
 
             # Process remaining pages for this sync cycle
@@ -738,7 +763,6 @@ class Client:
                 self._process_pages(progress, task_id, sync_token, next_resume_token)
 
             # Check if we need another sync cycle
-            # Google Photos app triggers next sync when server indicates more data
             should_continue = self._should_trigger_next_sync(response)
             if not should_continue:
                 break
@@ -790,16 +814,21 @@ class Client:
             self._process_pages_init(progress, task_id, resume_token)
 
         response = self.api.get_library_state(sync_token)
-        sync_token, resume_token, remote_media, _ = parse_db_update(response)
+        sync_token, resume_token, remote_media, collections, media_keys_to_delete, collection_keys_to_delete = parse_db_update(response)
 
         with Storage(self.db_path) as storage:
             storage.update_sync_tokens(sync_token, resume_token)
             storage.update(remote_media)
+            storage.update_collections(collections)
+            storage.delete(media_keys_to_delete)
+            storage.delete_collections(collection_keys_to_delete)
 
         task = progress.tasks[int(task_id)]
         progress.update(
             task_id,
             updated=task.fields["updated"] + len(remote_media),
+            media_deleted=task.fields["media_deleted"] + len(media_keys_to_delete),
+            collection_deleted=task.fields["collection_deleted"] + len(collection_keys_to_delete),
             pages=task.fields["pages"] + 1,
         )
 
@@ -826,19 +855,22 @@ class Client:
         page_count = 0
         while True:
             response = self.api.get_library_page_init(next_resume_token)
-            _, next_resume_token, remote_media, media_keys_to_delete = parse_db_update(response)
+            _, next_resume_token, remote_media, collections, media_keys_to_delete, collection_keys_to_delete = parse_db_update(response)
             page_count += 1
 
             with Storage(self.db_path) as storage:
                 storage.update_sync_tokens(resume_token=next_resume_token)
                 storage.update(remote_media)
+                storage.update_collections(collections)
                 storage.delete(media_keys_to_delete)
+                storage.delete_collections(collection_keys_to_delete)
 
             task = progress.tasks[int(task_id)]
             progress.update(
                 task_id,
                 updated=task.fields["updated"] + len(remote_media),
-                deleted=task.fields["deleted"] + len(media_keys_to_delete),
+                media_deleted=task.fields["media_deleted"] + len(media_keys_to_delete),
+                collection_deleted=task.fields["collection_deleted"] + len(collection_keys_to_delete),
                 pages=task.fields["pages"] + 1,
             )
 
@@ -867,23 +899,29 @@ class Client:
         page_count = 0
         while True:
             response = self.api.get_library_page(next_resume_token, sync_token)
-            _, next_resume_token, remote_media, media_keys_to_delete = parse_db_update(response)
+            _, next_resume_token, remote_media, collections, media_keys_to_delete, collection_keys_to_delete = parse_db_update(response)
             page_count += 1
 
             with Storage(self.db_path) as storage:
                 storage.update_sync_tokens(resume_token=next_resume_token)
                 storage.update(remote_media)
+                storage.update_collections(collections)
                 storage.delete(media_keys_to_delete)
+                storage.delete_collections(collection_keys_to_delete)
 
             task = progress.tasks[int(task_id)]
             progress.update(
                 task_id,
                 updated=task.fields["updated"] + len(remote_media),
-                deleted=task.fields["deleted"] + len(media_keys_to_delete),
+                media_deleted=task.fields["media_deleted"] + len(media_keys_to_delete),
+                collection_deleted=task.fields["collection_deleted"] + len(collection_keys_to_delete),
                 pages=task.fields["pages"] + 1,
             )
 
-            self.logger.debug(f"Delta sync page {page_count}: {len(remote_media)} items, {len(media_keys_to_delete)} deletions")
+            self.logger.debug(
+                f"Delta sync page {page_count}: {len(remote_media)} items, "
+                f"{len(media_keys_to_delete)} media deletions, {len(collection_keys_to_delete)} album deletions"
+            )
 
             if not next_resume_token:
                 break

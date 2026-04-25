@@ -15,6 +15,7 @@ Google Photos client based on reverse engineered mobile API.
 - Skips files already present in your account.
 - Upload individual files or entire directories, with optional recursive scanning.
 - Album creation based on directory structure or custom album name.
+- Smart album reuse: upload can reuse an existing album with the same name.
 - Real-time progress tracking.
 - Configurable threads for faster uploads (default: 1).
 
@@ -82,7 +83,7 @@ options:
   --recursive           Scan the directory recursively.
   --threads THREADS     Number of threads to run uploads with. Defaults to 1.
   --force-upload        Upload files regardless of their presence in Google Photos (determined by hash).
-  --delete-from-host    Delete uploaded files from source path.
+  --delete-from-host    Delete each file immediately after its individual upload completes.
   --use-quota           Uploaded files will count against your Google Photos storage quota.
   --saver               Upload files in storage saver quality.
   --timeout TIMEOUT     Requests timeout, seconds. Defaults to 60.
@@ -95,6 +96,24 @@ File Filter Options:
   --regex               Use regex for filtering.
   --ignore-case         Perform case-insensitive matching.
   --match-path          Check for matches in the path, not just the filename.
+```
+
+### Album Management
+
+When `--album` is used, the client refreshes the local cache before album operations and tries to reuse an existing album with the same name.
+
+Behavior:
+- If the album exists in cache, new items are appended to the existing album.
+- If the album does not exist, a new album is created.
+- Album title matching is case-sensitive.
+
+Example:
+
+```python
+from gpmc import Client
+
+client = Client(auth_data=auth_data)
+client.upload(target="/path/to/photos", album_name="Vacation 2026", show_progress=True)
 ```
 
 ## auth_data? Where Do I Get Mine?

@@ -4,3 +4,9 @@ __pycache__
 /build
 /dist
 uv.lock
+
+# Local reimplementation-only tests (not in upstream)
+tests/test_album_reuse.py
+tests/test_album_reuse_integration.py
+tests/test_collection_deletion.py
+tests/test_deletion_parser.py

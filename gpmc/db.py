@@ -4,12 +4,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Self
 
-from .models import MediaItem
+from .models import CollectionItem, MediaItem
 
 
 class Storage:
     # Database schema version - increment when schema changes
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, db_path: str | Path) -> None:
         self.conn = sqlite3.connect(db_path)
@@ -56,6 +56,9 @@ class Storage:
         if current_version < 2:
             self._migrate_v1_to_v2()
 
+        if current_version < 3:
+            self._migrate_v2_to_v3()
+
         if current_version < self.SCHEMA_VERSION:
             self._set_schema_version(self.SCHEMA_VERSION)
 
@@ -94,8 +97,27 @@ class Storage:
             """)
             self.conn.commit()
 
+    def _migrate_v2_to_v3(self) -> None:
+        """Migration v2 -> v3: add collections cache table."""
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS collections (
+            collection_media_key TEXT PRIMARY KEY,
+            collection_album_id TEXT,
+            title TEXT,
+            total_items INTEGER,
+            type INTEGER,
+            sort_order INTEGER,
+            is_custom_ordered INTEGER,
+            cover_item_media_key TEXT,
+            start INTEGER,
+            end INTEGER,
+            last_activity_time_ms INTEGER
+        )
+        """)
+        self.conn.commit()
+
     def _create_tables(self) -> None:
-        """Create the remote_media table if it doesn't exist."""
+        """Create local cache tables if they don't exist."""
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS remote_media (
             media_key TEXT PRIMARY KEY,
@@ -142,6 +164,22 @@ class Storage:
         """)
 
         self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS collections (
+            collection_media_key TEXT PRIMARY KEY,
+            collection_album_id TEXT,
+            title TEXT,
+            total_items INTEGER,
+            type INTEGER,
+            sort_order INTEGER,
+            is_custom_ordered INTEGER,
+            cover_item_media_key TEXT,
+            start INTEGER,
+            end INTEGER,
+            last_activity_time_ms INTEGER
+        )
+        """)
+
+        self.conn.execute("""
         CREATE TABLE IF NOT EXISTS state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             sync_token TEXT,
@@ -183,9 +221,33 @@ class Storage:
         with self.conn:
             self.conn.executemany(sql, values)
 
+    def update_collections(self, items: Iterable[CollectionItem]) -> None:
+        """Insert or update multiple CollectionItems in the database."""
+        items_list = list(items)
+        if not items_list:
+            return
+
+        items_dicts = [asdict(item) for item in items_list]
+
+        columns = items_dicts[0].keys()
+        placeholders = ", ".join("?" * len(columns))
+        columns_str = ", ".join(columns)
+        updates = ", ".join(f"{col}=excluded.{col}" for col in columns if col != "collection_media_key")
+
+        sql = f"""
+        INSERT INTO collections ({columns_str})
+        VALUES ({placeholders})
+        ON CONFLICT(collection_media_key) DO UPDATE SET {updates}
+        """
+
+        values = [tuple(item[col] for col in columns) for item in items_dicts]
+
+        with self.conn:
+            self.conn.executemany(sql, values)
+
     def delete(self, media_keys: Sequence[str]) -> None:
         """
-        Delete multiple rows by their media_key.
+        Delete multiple media items by their media_key.
 
         Args:
             media_keys: A sequence of media_key values to delete
@@ -202,6 +264,99 @@ class Storage:
         # Execute in a transaction
         with self.conn:
             self.conn.execute(sql, media_keys)
+
+    def delete_collections(self, collection_keys: Sequence[str]) -> None:
+        """
+        Delete multiple collections by their collection_media_key or collection_album_id.
+
+        Args:
+            collection_keys: A sequence of collection_media_key or collection_album_id values to delete.
+        """
+        keys = list(collection_keys)
+        if not keys:
+            return
+
+        placeholders = ",".join(["?"] * len(keys))
+        sql = f"""
+        DELETE FROM collections
+        WHERE collection_media_key IN ({placeholders})
+           OR collection_album_id IN ({placeholders})
+        """
+
+        with self.conn:
+            self.conn.execute(sql, [*keys, *keys])
+
+    def get_collections(self, limit: int | None = None) -> list[CollectionItem]:
+        """
+        Retrieve collections (albums) from the local cache.
+
+        Args:
+            limit: Optional limit on number of collections to retrieve.
+
+        Returns:
+            list[CollectionItem]: Collections ordered by latest activity.
+        """
+        sql = "SELECT * FROM collections ORDER BY last_activity_time_ms DESC"
+        params: tuple[int, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+
+        cursor = self.conn.execute(sql, params)
+        columns = [description[0] for description in cursor.description]
+
+        collections = []
+        for row in cursor.fetchall():
+            row_dict = dict(zip(columns, row, strict=True))
+            row_dict["is_custom_ordered"] = bool(row_dict["is_custom_ordered"])
+            collections.append(CollectionItem(**row_dict))
+
+        return collections
+
+    def get_collection_by_id(self, collection_media_key: str) -> CollectionItem | None:
+        """
+        Retrieve a collection by collection_media_key.
+
+        Args:
+            collection_media_key: Target collection media key.
+
+        Returns:
+            CollectionItem | None: Matching collection or None.
+        """
+        cursor = self.conn.execute("SELECT * FROM collections WHERE collection_media_key = ?", (collection_media_key,))
+        columns = [description[0] for description in cursor.description]
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        row_dict = dict(zip(columns, row, strict=True))
+        row_dict["is_custom_ordered"] = bool(row_dict["is_custom_ordered"])
+        return CollectionItem(**row_dict)
+
+    def get_collection_by_title(self, title: str) -> CollectionItem | None:
+        """
+        Retrieve the most recently active collection by exact title.
+
+        Args:
+            title: Collection title to match (case-sensitive).
+
+        Returns:
+            CollectionItem | None: Matching collection or None.
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM collections WHERE title = ? ORDER BY last_activity_time_ms DESC LIMIT 1",
+            (title,),
+        )
+        columns = [description[0] for description in cursor.description]
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        row_dict = dict(zip(columns, row, strict=True))
+        row_dict["is_custom_ordered"] = bool(row_dict["is_custom_ordered"])
+        return CollectionItem(**row_dict)
 
     def get_sync_tokens(self) -> tuple[str, str]:
         """

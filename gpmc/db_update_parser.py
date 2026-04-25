@@ -1,7 +1,7 @@
 import base64
 import logging
 
-from .models import MediaItem
+from .models import CollectionItem, MediaItem
 from .utils import fixed32_to_float, int32_to_float, int64_to_float, urlsafe_base64
 
 logger = logging.getLogger(__name__)
@@ -183,33 +183,52 @@ def _parse_media_item(d: dict) -> MediaItem:
     return item
 
 
-def _parse_deletion_item(d: dict) -> str | None:
-    """Parse a single deletion item from the raw data."""
-    type = _to_int(_get_nested(d, "1", "1"))
-    if type == 1:
-        return _to_string(_get_nested(d, "1", "2", "1"))
-    return None
-    # if type == 4:
-    #     return d["1"]["5"]["2"]
-    # if type == 6:
-    #     return d["1"]["7"]["1"]
+def _parse_deletion_item(d: dict) -> tuple[int, str | None]:
+    """
+    Parse a single deletion item.
+
+    Returns:
+        tuple[int, str | None]: (deletion_type, item_key)
+            - type 1: media item deletion
+            - type 2: collection deletion (primary format)
+            - type 4: collection deletion (variant)
+            - type 6: collection deletion (variant)
+    """
+    deletion_type = _to_int(_get_nested(d, "1", "1"))
+
+    if deletion_type == 1:
+        return deletion_type, _to_string(_get_nested(d, "1", "2", "1"))
+    if deletion_type == 2:
+        return deletion_type, _to_string(_get_nested(d, "1", "3", "1"))
+    if deletion_type == 4:
+        return deletion_type, _to_string(_get_nested(d, "1", "5", "2"))
+    if deletion_type == 6:
+        return deletion_type, _to_string(_get_nested(d, "1", "7", "1"))
+
+    if deletion_type:
+        logger.debug("Unknown deletion type encountered: %s", deletion_type)
+    return deletion_type, None
 
 
-# def _parse_collection_item(d: dict) -> CollectionItem:
-#     """Parse a single collection item from the raw data."""
-#     return CollectionItem(
-#         collection_media_key=d["1"],
-#         collection_album_id=d["4"]["2"]["3"],
-#         cover_item_media_key=d["2"].get("17", {}).get("1"),
-#         start=d["2"]["10"]["6"]["1"],
-#         end=d["2"]["10"]["7"]["1"],
-#         last_activity_time_ms=d["2"]["10"]["10"],
-#         title=d["2"]["5"],
-#         total_items=d["2"]["7"],
-#         type=d["2"]["8"],
-#         sort_order=d["19"]["1"],
-#         is_custom_ordered=d["19"]["2"] == 1,
-#     )
+def _parse_collection_item(d: dict) -> CollectionItem:
+    """Parse a single collection item from the raw data."""
+    collection_media_key = _to_string(d.get("1"))
+    if not collection_media_key:
+        raise RuntimeError("Error parsing collection_media_key")
+
+    return CollectionItem(
+        collection_media_key=collection_media_key,
+        collection_album_id=_to_string(_get_nested(d, "4", "2", "3")) or "",
+        cover_item_media_key=_to_string(_get_nested(d, "2", "17", "1")),
+        start=_to_optional_int(_get_nested(d, "2", "10", "6", "1")),
+        end=_to_optional_int(_get_nested(d, "2", "10", "7", "1")),
+        last_activity_time_ms=_to_optional_int(_get_nested(d, "2", "10", "10")),
+        title=_to_string(_get_nested(d, "2", "5")) or "Untitled",
+        total_items=_to_int(_get_nested(d, "2", "7")),
+        type=_to_int(_get_nested(d, "2", "8")),
+        sort_order=_to_int(_get_nested(d, "19", "1")),
+        is_custom_ordered=_to_int(_get_nested(d, "19", "2")) == 1,
+    )
 
 
 # def _parse_envelope_item(d: dict) -> EnvelopeItem:
@@ -224,7 +243,7 @@ def _get_items_list(data: dict, key: str) -> list[dict]:
     return [items] if isinstance(items, dict) else items
 
 
-def parse_db_update(data: dict) -> tuple[str, str | None, list[MediaItem], list[str]]:
+def parse_db_update(data: dict) -> tuple[str, str | None, list[MediaItem], list[CollectionItem], list[str], list[str]]:
     """
     Parse the library state from the raw data.
 
@@ -233,7 +252,9 @@ def parse_db_update(data: dict) -> tuple[str, str | None, list[MediaItem], list[
         - sync_token: Token for next sync cycle (NEXT_SYNC in Google Photos app)
         - resume_token: Token for pagination within current sync (INITIAL_RESUME/DELTA_RESUME in app)
         - remote_media: List of parsed media items
+        - collections: List of parsed collections
         - media_keys_to_delete: List of media keys to delete
+        - collection_keys_to_delete: List of collection keys to delete
     """
     root = data.get("1", {}) if isinstance(data, dict) else {}
     resume_token = _to_string(root.get("1")) or ""
@@ -251,14 +272,34 @@ def parse_db_update(data: dict) -> tuple[str, str | None, list[MediaItem], list[
         except Exception:
             logger.warning("Failed to parse media item (media_key=%s)", d.get("1", "unknown"), exc_info=True)
 
-    deletions = _get_items_list(data, "9")
-    media_keys_to_delete = [media_key for d in deletions if (media_key := _parse_deletion_item(d))]
+    collections = []
+    collection_items = _get_items_list(data, "3")
+    for d in collection_items:
+        if not isinstance(d, dict):
+            logger.warning("Skipping non-dict collection entry: %s", type(d).__name__)
+            continue
+        try:
+            collections.append(_parse_collection_item(d))
+        except Exception:
+            logger.warning("Failed to parse collection item (collection_key=%s)", d.get("1", "unknown"), exc_info=True)
 
-    # collections = _get_items_list(data, "3")
-    # remote_media.extend(_parse_collection_item(d) for d in collections)
+    deletions = _get_items_list(data, "9")
+    media_keys_to_delete = []
+    collection_keys_to_delete = []
+    for d in deletions:
+        if not isinstance(d, dict):
+            logger.warning("Skipping non-dict deletion entry: %s", type(d).__name__)
+            continue
+        deletion_type, item_key = _parse_deletion_item(d)
+        if not item_key:
+            continue
+        if deletion_type == 1:
+            media_keys_to_delete.append(item_key)
+        elif deletion_type in (2, 4, 6):
+            collection_keys_to_delete.append(item_key)
 
     # envelopes = _get_items_list(data, "12")
     # for d in envelopes:
     #     _parse_envelope_item(d)
 
-    return sync_token, resume_token, remote_media, media_keys_to_delete
+    return sync_token, resume_token, remote_media, collections, media_keys_to_delete, collection_keys_to_delete
